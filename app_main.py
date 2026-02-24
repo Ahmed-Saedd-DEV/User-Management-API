@@ -3,14 +3,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from session.reutes import auth, users, post
 from session.models import ORMmodels
 from session.security.security_headers import SecurityHeadersMiddleware
+from session.security.ban_middleware import BanMiddleware
 from DATABASE.db import engine
 
 app = FastAPI()
 app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(BanMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:8000"],
-    allow_methodes=["*"],
+    allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
 )

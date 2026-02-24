@@ -30,7 +30,7 @@ async def login(
     db: Session = Depends(get_db),
     _: None = Depends(rate_limit_login),
 ):
-    return check_token(
+    return await check_token(
         request=request,
         response=response,
         db=db,
@@ -46,19 +46,25 @@ async def refrech(
     db: Session = Depends(get_db),
     _: None = Depends(rate_limit_refresh),
 ):
-    return check_refresh(request=request, response=response, db=db)
+    return await check_refresh(request=request, response=response, db=db)
 
 
 @router.post("/logout")
-def logout(request: Request, response: Response, db: Session = Depends(get_db)):
-    return delete_rfresh(request=request, response=response, db=db)
+async def logout(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    return await delete_rfresh(request=request, response=response, db=db)
 
 
 @router.post("/logout_all")
-def logout(
+async def logout(
     request: Request,
     response: Response,
     db: Session = Depends(get_db),
     current: ORMUser = Depends(decode_access_token),
 ):
-    return delete_all_refresh(request=request, response=response, db=db, user=current)
+    return await delete_all_refresh(
+        request=request, response=response, db=db, user=current
+    )

@@ -10,58 +10,69 @@ from session.security.jwt_handler import (
     create_refresh_token,
     create_csrf_token,
 )
-from session.security.rate_limit import register_failed_login, _get_device_identifier
+from jose import jwt
+from session.security.rate_limit import (
+    register_failed_login,
+    _get_device_identifier,
+    reset_login_attempts,
+    register_csrf_failure,
+)
+from session.security.cookie_utils import cookie_options
 from session.core.redis import redis_client
 import uuid
 
 
 pwd = CryptContext(schemes=["argon2", "bcrypt"], deprecated="auto")
 csrf_header_name = "X-CSRF-Token"
+SECRET_KEY = "ypur-very-long-random-secret-key-here-1234567890!@#$%^&*()_2026"
+ALGORITHM = "HS256"
 
 
-def hash_password(password: str) -> str:
+async def hash_password(password: str) -> str:
     return pwd.hash(password)
 
 
-def generate_device_id():
+async def generate_device_id():
     return str(uuid.uuid4())
 
 
-def get_csrf_cookie(request: Request) -> str:
+async def get_csrf_cookie(request: Request) -> str:
     crsf_cookie = request.cookies.get("csrf_token")
     return crsf_cookie
 
 
-def check_token(
+async def check_token(
     request: Request, response: Response, db: Session, username: str, password: str
 ):
     existing_user = db.query(ORMUser).filter(ORMUser.username == username).first()
     if not existing_user:
-        register_failed_login(request=request)
+        await register_failed_login(request=request)
         raise HTTPException(status_code=401, detail="Username not found")
 
     # model stores hashed password in `hashed_password`
     if not pwd.verify(password, existing_user.hashed_password):
-        register_failed_login(request=request)
+        await register_failed_login(request=request)
         raise HTTPException(status_code=401, detail="Invalid password")
 
-    device_id = generate_device_id()
+    device_id = await generate_device_id()
+    opts = cookie_options(is_csrf=False)
     response.set_cookie(
         key="device_id",
         value=device_id,
-        httponly=False,  # dev
-        secure=False,  # dev
-        samesite="lax",
+        httponly=opts.get("httponly", False),
+        secure=opts.get("secure", False),
+        samesite=opts.get("samesite", "lax"),
     )
     csrf_token = create_csrf_token()
+    opts_csrf = cookie_options(is_csrf=True)
     response.set_cookie(
         key="csrf_token",
         value=csrf_token,
-        httponly=False,  # dev
-        secure=False,  # dev
-        samesite="lax",
+        httponly=opts_csrf.get("httponly", False),
+        secure=opts_csrf.get("secure", False),
+        samesite=opts_csrf.get("samesite", "lax"),
     )
-    device_ip = request.client.host()
+    device_ip = request.client.host
 
     access_token = create_access_token(
         {
@@ -85,18 +96,21 @@ def check_token(
         )
     )
     db.commit()
+    # reset login attempts after successful authentication
+    await reset_login_attempts(request=request)
     response = JSONResponse({"access_token": access_token})
+    opts_refresh = cookie_options(is_csrf=False)
     response.set_cookie(
         key="refresh_token",
         value=refresh_token,
-        httponly=True,
-        secure=False,  # dev
-        samesite="lax",
+        httponly=opts_refresh.get("httponly", True),
+        secure=opts_refresh.get("secure", False),
+        samesite=opts_refresh.get("samesite", "lax"),
     )
     return response
 
 
-def check_refresh(
+async def check_refresh(
     request: Request,
     db: Session,
     response: Response,
@@ -111,7 +125,7 @@ def check_refresh(
     refrech_token = request.cookies.get("refresh_token")
     device_id = request.cookies.get("device_id")
     if not refrech_token or not device_id:
-        raise HTTPException(status_code=401, detail="Not authrnticated")
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
     token_db = (
         db.query(ORMRefreshToken)
@@ -123,17 +137,39 @@ def check_refresh(
     )
 
     if not token_db:
-        raise HTTPException(status_code=401, detail="Invalid refersh token")
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
 
     if token_db.expires_at < datetime.now():
         db.delete(token_db)
         db.commit()
-        raise HTTPException(status_code=401, detail="Expired refersh token")
+        raise HTTPException(status_code=401, detail="Expired refresh token")
 
     if token_db.is_revoked:
-        device = _get_device_identifier(request=request)
+        # blacklist current access token (if present) to prevent reuse
+        try:
+            auth = request.headers.get("Authorization")
+            if auth and auth.startswith("Bearer "):
+                at = auth.split(" ", 1)[1]
+                try:
+                    payload = jwt.decode(at, SECRET_KEY, algorithms=[ALGORITHM])
+                    jti = payload.get("jti")
+                    exp = payload.get("exp")
+                    if jti and exp:
+                        ttl = int(exp - datetime.now().timestamp())
+                        if ttl > 0:
+                            await redis_client.setex(
+                                f"blacklist_access:{jti}", ttl, "1"
+                            )
+                except Exception:
+                    # invalid access token - ignore safely
+                    pass
+        except Exception:
+            # any problem extracting header should not block refresh handling
+            pass
+
+        device = await _get_device_identifier(request=request)
         ban_key = f"ban:{device}"
-        redis_client.setex(ban_key,600,"1")
+        await redis_client.setex(ban_key, 600, "1")
         db.query(ORMRefreshToken).filter(
             ORMRefreshToken.device_id == token_db.device_id
         ).update({"is_revoked": True})
@@ -146,7 +182,7 @@ def check_refresh(
 
     token_db.is_revoked = True
     user = db.get(ORMUser, token_db.user_id)
-    device_ip = request.client.host()
+    device_ip = request.client.host
     access_token = create_access_token(
         {
             "id": user.id,
@@ -180,7 +216,7 @@ def check_refresh(
     return response
 
 
-def delete_rfresh(
+async def delete_rfresh(
     request: Request,
     db: Session,
     response: Response,
@@ -196,7 +232,7 @@ def delete_rfresh(
     refresh_token = request.cookies.get("refresh_token")
     device_id = request.cookies.get("device_id")
     if not refresh_token:
-        raise HTTPException(status_code=401, detail="Not authrnticated")
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
     token_db = (
         db.query(ORMRefreshToken)
@@ -210,13 +246,26 @@ def delete_rfresh(
     if token_db:
         token_db.is_revoked = True
         db.commit()
-    response = JSONResponse({"massage": "logged out"})
+    token = request.headers.get("Authorization")
+    if token and token.startswith("Bearer "):
+        token = token.split(" ")[1]
+
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            jti = payload.get("jti")
+            exp = payload.get("exp")
+            ttl = int(exp - datetime.now().timestamp())
+            if jti and ttl > 0:
+                await redis_client.setex(f"blacklist_access:{jti}", ttl, "1")
+        except:
+            pass
+    response = JSONResponse({"message": "logged out"})
     response.delete_cookie("refresh_token")
     response.delete_cookie("device_id")
     return response
 
 
-def delete_all_refresh(
+async def delete_all_refresh(
     request: Request,
     db: Session,
     response: Response,
@@ -236,7 +285,20 @@ def delete_all_refresh(
         .update({"is_revoked": True})
     )
     db.commit()
-    response = JSONResponse({"massage": "logged out"})
+    token = request.headers.get("Authorization")
+    if token and token.startswith("Bearer "):
+        token = token.split(" ")[1]
+
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            jti = payload.get("jti")
+            exp = payload.get("exp")
+            ttl = int(exp - datetime.now().timestamp())
+            if jti and ttl > 0:
+                await redis_client.setex(f"blacklist_access:{jti}", ttl, "1")
+        except:
+            pass
+    response = JSONResponse({"message": "logged out"})
     response.delete_cookie("refresh_token")
     response.delete_cookie("device_id")
     return response

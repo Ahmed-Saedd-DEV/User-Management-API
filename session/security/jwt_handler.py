@@ -5,12 +5,14 @@ from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 from DATABASE.db import get_db
 from session.models.ORMmodels import ORMUser
+from session.core.redis import redis_client
 import secrets
+import uuid
 
 SECRET_KEY = "ypur-very-long-random-secret-key-here-1234567890!@#$%^&*()_2026"
 ALGORITHM = "HS256"
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 
 def create_access_token(data: dict, expire: timedelta | None = None):
@@ -21,7 +23,14 @@ def create_access_token(data: dict, expire: timedelta | None = None):
     else:
         exp = datetime.now() + timedelta(hours=1)
 
-    to_encode.update({"type": "access", "exp": exp})
+    jti = str(uuid.uuid4())
+    to_encode.update(
+        {
+            "type": "access",
+            "exp": exp,
+            "jti": jti,
+        }
+    )
 
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -34,7 +43,7 @@ def create_csrf_token():
     return secrets.token_urlsafe(48)
 
 
-def decode_access_token(
+async def decode_access_token(
     token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
 ):
 
@@ -45,9 +54,14 @@ def decode_access_token(
         username: str | None = payload.get("sub")
         role: str | None = payload.get("role")
         type: str | None = payload.get("type")
+        jti: str | None = payload.get("jti")
 
-        if username is None or role is None or type != "access":
+        if username is None or role is None or type != "access" or jti is None:
             raise HTTPException(status_code=401, detail="Invalid token payload")
+
+        blacklisted = await redis_client.get(f"blacklist_access:{jti}")
+        if blacklisted:
+            raise HTTPException(status_code=401, detail="Token revo")
 
         # load user from DB to ensure it still exists and fetch current role
         user = db.query(ORMUser).filter(ORMUser.username == username).first()
@@ -59,6 +73,6 @@ def decode_access_token(
     except JWTError as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token: {e}",
-            headers={"WWW-Authorization": "Bearer"},
+            detail=f"Invalid token: {e}",
+            headers={"WWW-Authenticate": "Bearer"},
         )

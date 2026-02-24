@@ -5,12 +5,14 @@ from session.models.RegisterModels import UpdateUser
 from session.services.user_service import hash_password
 
 
-def check_allusers(current:dict):
+def check_allusers(current: dict):
     if current.get("role") not in ["moderator", "admin"]:
-        raise HTTPException(status_code=403, detail="false access")
-    
-    
-def check_user_update(target: ORMUser, username:str, use: UpdateUser, current: dict, db: Session):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+
+def check_user_update(
+    target: ORMUser, username: str, use: UpdateUser, current: dict, db: Session
+):
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
 

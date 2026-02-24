@@ -6,13 +6,16 @@ from starlette.responses import Response
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response: Response = await call_next(request)
-
-        response.headers["X-frame-options"] = "DENY"
-        response.headers["X-content-type-options"] = "strict-origin-when-cross-origin"
-        response.headers["permissions-policy"] = (
-            "camera=()," "microphone=()," "payment=()"
+        # Standard security headers
+        response.headers["X-Frame-Options"] = "DENY"
+        # Prevent content sniffing
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        # Permissions-Policy (formerly Feature-Policy) - deny by default
+        response.headers["Permissions-Policy"] = (
+            "camera=() , microphone=() , payment=()"
         )
-        response.headers["Content-security-policy"] = (
-            "default-str 'none';" "frame-ancestors 'none';" "base-uri 'none';"
+        # Content-Security-Policy - minimal restrictive policy
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; frame-ancestors 'none'; base-uri 'none';"
         )
         return response
